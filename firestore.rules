@@ -1,0 +1,1362 @@
+rules_version = '2';
+service cloud.firestore {
+  // Google and password sign-in use the same authenticated UID permissions.
+  // OAuth authorized domains are configured in Firebase Authentication, not here.
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function account() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function globalAdministrator() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        account().get("role", "") == "Administrator";
+    }
+    function validName(value) { return value is string && value.size() >= 2 && value.size() <= 120; }
+    function licenseActive(data) {
+      return data.get("manualLocked", false) == false && (
+        (data.status == "Active" && data.expiresAt is timestamp && data.expiresAt > request.time) ||
+        (data.status == "Trial" && data.trialStartedAt is timestamp &&
+          data.trialStartedAt + duration.value(7, 'd') > request.time)
+      );
+    }
+    function shopAccessActive(shopId) {
+      return licenseActive(get(/databases/$(database)/documents/shops/$(shopId)/settings/access).data);
+    }
+    function currentShopRole() {
+      return globalAdministrator() ? "Administrator" : (
+        signedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        account().get("activeShopId", "") != "" && shopAccessActive(account().activeShopId) &&
+        exists(/databases/$(database)/documents/shops/$(account().activeShopId)/members/$(request.auth.uid))
+          ? get(/databases/$(database)/documents/shops/$(account().activeShopId)/members/$(request.auth.uid)).data.get("role", "")
+          : ""
+      );
+    }
+    match /users/{uid} {
+      allow get: if signedIn() && (uid == request.auth.uid || globalAdministrator() || (
+        currentShopRole() in ["Administrator", "Manager"] &&
+        exists(/databases/$(database)/documents/shops/$(account().activeShopId)/members/$(uid))
+      ));
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.uid == uid && validName(request.resource.data.name) &&
+        request.resource.data.createdAt == request.time && (
+          (uid == request.auth.uid && request.resource.data.keys().hasOnly(["uid", "name", "email", "role", "createdAt"]) &&
+            request.resource.data.role == "Customer" && request.resource.data.email == request.auth.token.email) ||
+          (uid != request.auth.uid && currentShopRole() in ["Administrator", "Manager"] &&
+            request.resource.data.keys().hasOnly(["uid", "name", "email", "role", "createdAt", "createdBy", "shopId", "activeShopId"]) &&
+            request.resource.data.email is string && request.resource.data.createdBy == request.auth.uid && (
+              (request.resource.data.role == "Service Provider" && request.resource.data.shopId == account().activeShopId &&
+                request.resource.data.activeShopId == account().activeShopId &&
+                getAfter(/databases/$(database)/documents/shops/$(account().activeShopId)/members/$(uid)).data.role == "Service Provider") ||
+              (currentShopRole() == "Administrator" && request.resource.data.role in ["Administrator", "Manager"] &&
+                !request.resource.data.keys().hasAny(["shopId", "activeShopId"]))
+            ))
+        );
+      allow update: if signedIn() && request.resource.data.updatedAt == request.time && (
+        (uid == request.auth.uid && globalAdministrator() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["activeShopId", "updatedAt"]) &&
+          request.resource.data.activeShopId is string &&
+          exists(/databases/$(database)/documents/shops/$(request.resource.data.activeShopId))) ||
+        ((uid == request.auth.uid || globalAdministrator()) &&
+          validName(request.resource.data.name) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "updatedAt"])) ||
+        (uid == request.auth.uid && resource.data.role == "Customer" &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["activeShopId", "joinedShopIds", "updatedAt"]) &&
+          request.resource.data.activeShopId is string && request.resource.data.joinedShopIds is list &&
+          request.resource.data.joinedShopIds.size() <= 50 &&
+          request.resource.data.joinedShopIds.size() == request.resource.data.joinedShopIds.toSet().size() &&
+          request.resource.data.joinedShopIds.hasAll(resource.data.get("joinedShopIds", [])) &&
+          request.resource.data.joinedShopIds.toSet().difference(resource.data.get("joinedShopIds", []).toSet()).hasOnly([request.resource.data.activeShopId]) &&
+          request.resource.data.activeShopId in request.resource.data.joinedShopIds &&
+          getAfter(/databases/$(database)/documents/shops/$(request.resource.data.activeShopId)/members/$(uid)).data.role == "Customer" &&
+          (exists(/databases/$(database)/documents/shops/$(request.resource.data.activeShopId)/members/$(uid)) ||
+            (get(/databases/$(database)/documents/shops/$(request.resource.data.activeShopId)).data.active == true &&
+              get(/databases/$(database)/documents/shops/$(request.resource.data.activeShopId)).data.acceptingCustomers == true))) ||
+        (uid == request.auth.uid && resource.data.role in ["Administrator", "Manager"] &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["shopId", "activeShopId", "updatedAt"]) &&
+          request.resource.data.shopId == uid && request.resource.data.activeShopId == uid &&
+          getAfter(/databases/$(database)/documents/shops/$(uid)).data.ownerId == uid &&
+          getAfter(/databases/$(database)/documents/shops/$(uid)/members/$(uid)).data.role == resource.data.role) ||
+        (uid != request.auth.uid && currentShopRole() == "Administrator" &&
+          (globalAdministrator() || resource.data.role != "Customer") &&
+          exists(/databases/$(database)/documents/shops/$(account().activeShopId)/members/$(uid)) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["role", "shopId", "activeShopId", "joinedShopIds", "updatedAt"]) &&
+          request.resource.data.role in ["Administrator", "Manager", "Service Provider", "Customer"] &&
+          getAfter(/databases/$(database)/documents/shops/$(account().activeShopId)/members/$(uid)).data.role == request.resource.data.role &&
+          getAfter(/databases/$(database)/documents/shops/$(account().activeShopId)/team/$(uid)).data.role == request.resource.data.role &&
+          request.resource.data.get("shopId", account().activeShopId) == account().activeShopId)
+      );
+      allow delete: if false;
+    }
+    match /shops/{shopId} {
+      function rawMember() { return signedIn() && (exists(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)) || globalAdministrator()); }
+      function billingManager() {
+        return globalAdministrator() || (signedIn() &&
+          exists(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)).data.role in ["Manager", "Administrator"]);
+      }
+      function member() {
+        return signedIn() && (
+          (exists(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)) &&
+            (get(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)).data.role == "Customer" || shopAccessActive(shopId))) ||
+          globalAdministrator());
+      }
+      function shopManager() { return manager(); }
+      function directoryFields() {
+        return request.resource.data.keys().hasOnly(["name", "ownerId", "managerName", "location", "description", "serviceCategories", "logoUrl", "themeColor", "active", "acceptingCustomers", "createdAt", "updatedAt", "open", "close", "facebookUrl"]) &&
+          request.resource.data.get("facebookUrl", "") is string &&
+          request.resource.data.get("facebookUrl", "").size() <= 2000 &&
+          (
+            request.resource.data.get("facebookUrl", "") == "" ||
+            request.resource.data.facebookUrl.matches('^https://(www[.]|m[.]|web[.])?facebook[.]com(/.*)?$') ||
+            request.resource.data.facebookUrl.matches('^https://fb[.]me(/.*)?$')
+          ) &&
+          (
+            !request.resource.data.keys().hasAny(["facebookUrl"]) ||
+            request.resource.data.facebookUrl ==
+              getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/business).data.get("facebookUrl", "")
+          ) &&
+          (
+            !request.resource.data.keys().hasAny(["open", "close"]) ||
+            (
+              request.resource.data.keys().hasAll(["open", "close"]) &&
+              request.resource.data.open is string &&
+              request.resource.data.close is string &&
+              request.resource.data.open.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$') &&
+              request.resource.data.close.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$') &&
+              request.resource.data.open < request.resource.data.close &&
+              request.resource.data.open == getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/business).data.open &&
+              request.resource.data.close == getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/business).data.close
+            )
+          ) &&
+          request.resource.data.get("themeColor", "forest") in ["forest", "ocean", "plum", "bronze"] &&
+          validName(request.resource.data.name) && validName(request.resource.data.managerName) &&
+          request.resource.data.location is string && request.resource.data.location.size() <= 300 &&
+          request.resource.data.description is string && request.resource.data.description.size() <= 1000 &&
+          request.resource.data.serviceCategories is list && request.resource.data.serviceCategories.size() <= 30 &&
+          request.resource.data.logoUrl is string &&
+          (request.resource.data.logoUrl == "" || request.resource.data.logoUrl.matches('^https://.+$')) &&
+          request.resource.data.active is bool && request.resource.data.acceptingCustomers is bool && request.resource.data.updatedAt == request.time;
+      }
+      allow get: if signedIn() && (shopId == request.auth.uid ||
+        !exists(/databases/$(database)/documents/shops/$(shopId)) || rawMember() || resource.data.active == true);
+      allow list: if globalAdministrator() || (signedIn() && resource.data.active == true);
+      allow create: if signedIn() && shopId == request.auth.uid && account().role in ["Administrator", "Manager"] &&
+        request.resource.data.ownerId == request.auth.uid && request.resource.data.managerName == account().name &&
+        request.resource.data.createdAt == request.time && directoryFields() &&
+        getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)).data.role == account().role;
+      allow update: if shopManager() && directoryFields() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "managerName", "location", "description", "serviceCategories", "logoUrl", "themeColor", "active", "acceptingCustomers", "updatedAt", "open", "close", "facebookUrl"]);
+      allow delete: if false;
+      match /members/{uid} {
+        function selfCustomer() { return signedIn() && uid == request.auth.uid && account().role == "Customer"; }
+        allow get: if signedIn() && (uid == request.auth.uid || shopManager());
+        allow list: if shopManager();
+        allow create: if signedIn() && request.resource.data.uid == uid && validName(request.resource.data.name) &&
+          request.resource.data.email is string && request.resource.data.joinedAt == request.time &&
+          request.resource.data.keys().hasOnly(["uid", "name", "email", "role", "joinedAt"]) && (
+            (selfCustomer() && request.resource.data.role == "Customer" &&
+              request.resource.data.name == account().name && request.resource.data.email == account().email &&
+              get(/databases/$(database)/documents/shops/$(shopId)).data.active == true &&
+              get(/databases/$(database)/documents/shops/$(shopId)).data.acceptingCustomers == true &&
+              getAfter(/databases/$(database)/documents/users/$(uid)).data.activeShopId == shopId) ||
+            (uid == request.auth.uid && shopId == uid && account().role in ["Administrator", "Manager"] &&
+              request.resource.data.role == account().role && request.resource.data.name == account().name &&
+              request.resource.data.email == account().email && getAfter(/databases/$(database)/documents/shops/$(shopId)).data.ownerId == uid) ||
+            (shopManager() && request.resource.data.role == "Service Provider" &&
+              getAfter(/databases/$(database)/documents/users/$(uid)).data.shopId == shopId &&
+              getAfter(/databases/$(database)/documents/users/$(uid)).data.role == "Service Provider" &&
+              request.resource.data.name == getAfter(/databases/$(database)/documents/users/$(uid)).data.name &&
+              request.resource.data.email == getAfter(/databases/$(database)/documents/users/$(uid)).data.email)
+          );
+        allow update: if signedIn() && (
+          ((uid == request.auth.uid || globalAdministrator()) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "updatedAt"]) &&
+            request.resource.data.name == getAfter(/databases/$(database)/documents/users/$(uid)).data.name && request.resource.data.updatedAt == request.time) ||
+          (shopManager() && (globalAdministrator() || get(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)).data.role == "Administrator") && uid != request.auth.uid &&
+            (globalAdministrator() || resource.data.role != "Customer") &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(["role", "updatedAt"]) && request.resource.data.updatedAt == request.time &&
+            request.resource.data.role == getAfter(/databases/$(database)/documents/users/$(uid)).data.role)
+        );
+        allow delete: if false;
+      }
+
+      function signedIn() { return request.auth != null; }
+      function role() {
+        let membership = signedIn() && exists(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid))
+          ? get(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)).data.get("role", "") : "";
+        return globalAdministrator() ? "Administrator" : (
+          membership == "Customer" || (membership != "" && shopAccessActive(shopId))
+            ? membership
+            : ""
+        );
+      }
+      function manager() { return signedIn() && role() in ["Administrator", "Manager"]; }
+      function administrator() { return signedIn() && role() == "Administrator"; }
+      function recordEditor() {
+        return globalAdministrator() || (role() == "Manager" &&
+          account().get("role", "") == "Manager" &&
+          get(/databases/$(database)/documents/shops/$(shopId)).data.ownerId == request.auth.uid);
+      }
+      function recordTimeUnchanged(before, after) {
+        return after.get("date", null) == before.get("date", null) &&
+          after.get("durationMinutes", null) == before.get("durationMinutes", null) &&
+          after.get("time", null) == before.get("time", null) &&
+          after.get("startMinute", null) == before.get("startMinute", null) &&
+          after.get("startsAt", null) == before.get("startsAt", null);
+      }
+      function adminWalkInDetails(before, after) {
+        return (after.get("method", "") == before.get("method", "") ||
+            after.method in ["Cash", "E-wallet"]) &&
+          (after.get("providerId", "") == before.get("providerId", "") ||
+            (after.providerId is string && after.providerId.size() > 0 &&
+              get(/databases/$(database)/documents/shops/$(shopId)/team/$(after.providerId)).data.active == true &&
+              get(/databases/$(database)/documents/shops/$(shopId)/team/$(after.providerId)).data.role == "Service Provider" &&
+              after.provider == get(/databases/$(database)/documents/shops/$(shopId)/team/$(after.providerId)).data.name));
+      }
+      // Corrections preserve identity and creation metadata and require a server audit.
+      function adminRecordCorrection() {
+        // Normal booking writes carry no fresh correction audit. Keep this
+        // exceptional path cheap without changing their reservation permissions.
+        return request.resource.data.get("editedByAdmin", "") == request.auth.uid &&
+          request.resource.data.get("adminEditedAt", null) == request.time &&
+          recordEditor() &&
+          request.resource.data.updatedAt == request.time &&
+          request.resource.data.date is string &&
+          request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+          validName(request.resource.data.client) &&
+          request.resource.data.amount is number && request.resource.data.amount >= 0 &&
+          request.resource.data.amountCents is int &&
+          request.resource.data.amountCents == math.round(request.resource.data.amount * 100) &&
+          recordTimeUnchanged(resource.data, request.resource.data) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "client", "customerId", "email", "phone", "service", "serviceId",
+            "serviceIds", "serviceNames", "serviceAmounts", "provider", "providerId",
+            "requestedProviderId", "providerPreference", "reservedProviderId",
+            "scheduleId", "slotKeys",
+            "amount", "amountCents", "method", "status", "paymentStatus", "notes", "rejectionReason",
+            "editedByAdmin", "adminEditedAt", "updatedAt"
+          ]);
+      }
+      function cashier() { return signedIn() && role() in ["Administrator", "Manager", "Service Provider"]; }
+      function owner(data) { return signedIn() && role() == "Customer" && data.get("customerId", "") == request.auth.uid; }
+      // Date corrections are permanently revoked, including for old clients.
+      function temporaryManagerDateEditingEnabled() { return false; }
+      // Temporary cleanup access is independent of date/time editing.
+      function temporaryManagerRecordDeletionEnabled() { return true; }
+      function recordDeleter() {
+        return globalAdministrator() || (temporaryManagerRecordDeletionEnabled() &&
+          role() == "Manager" && account().get("role", "") == "Manager");
+      }
+      function ledgersDeleted(id) {
+        return !existsAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)) &&
+          !existsAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id));
+      }
+      function bookingSlotsReleased(id, data) {
+        let scheduleId = data.get("scheduleId", "");
+        return scheduleId == "" ||
+          !existsAfter(/databases/$(database)/documents/shops/$(shopId)/appointmentSchedules/$(scheduleId)) ||
+          !getAfter(/databases/$(database)/documents/shops/$(shopId)/appointmentSchedules/$(scheduleId)).data.slots.values().hasAny([id]);
+      }
+      function managerDateCorrection(before, after, booking) {
+        let parts = after.date.split('-');
+        // The whitelist freezes time/start-minute/slot keys. Booking-specific
+        // validation below keeps startsAt at that same clock time on a new date.
+        return before is map && before.keys().hasAll(["date"]) &&
+          after.date != before.date &&
+          temporaryManagerDateEditingEnabled() && role() == "Manager" &&
+          account().get("role", "") == "Manager" &&
+          after.date is string && after.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+          timestamp.date(int(parts[0]), int(parts[1]), int(parts[2])) is timestamp &&
+          (!after.keys().hasAny(["time"]) ||
+            (after.time is string && after.time.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$'))) &&
+          after.dateEditedBy == request.auth.uid &&
+          after.dateEditedAt == request.time && after.updatedAt == request.time &&
+          after.diff(before).affectedKeys().hasOnly(booking
+            ? ["date", "startsAt", "scheduleId", "dateEditedBy", "dateEditedAt", "updatedAt"]
+            : ["date", "dateEditedBy", "dateEditedAt", "updatedAt"]);
+      }
+      function managerLinkedDates(id, data) {
+        return (
+          !exists(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)) ||
+          (getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data.date == data.date &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data.dateEditedAt == request.time)
+        ) && (
+          !exists(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)) ||
+          (getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data.date == data.date &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data.dateEditedAt == request.time)
+        );
+      }
+      function managerCorrectedSlotKeys(data) {
+        let count = data.slotKeys.size();
+        let first = data.startMinute - data.startMinute % 15;
+        let text = data.slotKeys.join(',');
+        let expected = [
+          string(first), string(first + 15), string(first + 30), string(first + 45),
+          string(first + 60), string(first + 75), string(first + 90), string(first + 105),
+          string(first + 120), string(first + 135), string(first + 150), string(first + 165),
+          string(first + 180), string(first + 195), string(first + 210), string(first + 225),
+          string(first + 240)
+        ].join(',');
+        return data.startMinute is int && data.startMinute >= 0 &&
+          data.durationMinutes is int && data.durationMinutes >= 1 && data.durationMinutes <= 240 &&
+          data.startMinute + data.durationMinutes <= 1440 &&
+          data.slotKeys is list && count >= 1 && count <= 17 &&
+          count * 15 >= data.startMinute % 15 + data.durationMinutes &&
+          (count - 1) * 15 < data.startMinute % 15 + data.durationMinutes &&
+          text.matches('^[0-9]+(,[0-9]+){' + string(count - 1) + '}$') &&
+          expected.matches('^' + text + '(,.*)?$');
+      }
+      function managerOwnsSlots(slots, keys, id) {
+        let count = keys.size();
+        return count >= 1 && count <= 17 && slots.keys().hasAll(keys) &&
+          slots[keys[0]] == id &&
+          (count < 2 || slots[keys[1]] == id) &&
+          (count < 3 || slots[keys[2]] == id) &&
+          (count < 4 || slots[keys[3]] == id) &&
+          (count < 5 || slots[keys[4]] == id) &&
+          (count < 6 || slots[keys[5]] == id) &&
+          (count < 7 || slots[keys[6]] == id) &&
+          (count < 8 || slots[keys[7]] == id) &&
+          (count < 9 || slots[keys[8]] == id) &&
+          (count < 10 || slots[keys[9]] == id) &&
+          (count < 11 || slots[keys[10]] == id) &&
+          (count < 12 || slots[keys[11]] == id) &&
+          (count < 13 || slots[keys[12]] == id) &&
+          (count < 14 || slots[keys[13]] == id) &&
+          (count < 15 || slots[keys[14]] == id) &&
+          (count < 16 || slots[keys[15]] == id) &&
+          (count < 17 || slots[keys[16]] == id);
+      }
+      function managerBookingDateCorrection(id, before, after) {
+        let parts = after.date.split('-');
+        let time = after.get("time", "").split(':');
+        let holdsSlots = before.get("scheduleId", "") != "" && !(before.status in ["Cancelled", "Rejected"]);
+        let holder = before.get("reservedProviderId", "") != "" ? before.reservedProviderId : before.get("providerId", "");
+        return managerDateCorrection(before, after, true) &&
+          managerLinkedDates(id, after) &&
+          (after.get("time", "") == ""
+            ? (after.get("startsAt", null) == before.get("startsAt", null) &&
+                after.get("startMinute", null) == before.get("startMinute", null))
+            : (after.startMinute == int(time[0]) * 60 + int(time[1]) &&
+                after.startsAt == timestamp.date(int(parts[0]), int(parts[1]), int(parts[2])) +
+                  duration.value(after.startMinute - 480, 'm'))) &&
+          after.get("scheduleId", "") == (holdsSlots ? holder + '_' + after.date : before.get("scheduleId", "")) &&
+          (holdsSlots ? (
+            managerCorrectedSlotKeys(after) &&
+            !getAfter(/databases/$(database)/documents/shops/$(shopId)/appointmentSchedules/$(before.scheduleId)).data.slots.keys().hasAny(
+              before.slotKeys.removeAll(before.scheduleId == after.scheduleId ? after.slotKeys : [])) &&
+            slotsHeld(after, id)
+          ) : after.get("slotKeys", []) == before.get("slotKeys", []));
+      }
+      function validRole(value) { return value in ["Administrator", "Manager", "Service Provider", "Customer"]; }
+      function appointment(id) { return getAfter(/databases/$(database)/documents/shops/$(shopId)/appointments/$(id)).data; }
+      function assigned(data) {
+        let currentRole = role();
+        return signedIn() && data.get("providerId", "") == request.auth.uid &&
+        (currentRole == "Service Provider" || (currentRole == "Manager" &&
+          get(/databases/$(database)/documents/shops/$(shopId)/team/$(request.auth.uid)).data.role == "Service Provider" &&
+          get(/databases/$(database)/documents/shops/$(shopId)/team/$(request.auth.uid)).data.active == true));
+      }
+      function canCollect(data) {
+        let currentRole = role();
+        return currentRole in ["Administrator", "Manager"] || (
+          currentRole == "Service Provider" && data.get("providerId", "") == request.auth.uid &&
+          get(/databases/$(database)/documents/shops/$(shopId)/team/$(request.auth.uid)).data.active == true &&
+          get(/databases/$(database)/documents/shops/$(shopId)/team/$(request.auth.uid)).data.role == "Service Provider"
+        );
+      }
+      function availableForAssignment(data) {
+        return role() == "Service Provider" &&
+          data.get("providerId", "") == "" &&
+          data.get("providerPreference", "") == "any" &&
+          data.status == "Accepted";
+      }
+      function canCreateBooking(data) {
+        let currentRole = role();
+        return currentRole in ["Administrator", "Manager"] ||
+          (currentRole == "Customer" && data.customerId == request.auth.uid &&
+            data.client == get(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)).data.name);
+      }
+      function validAssignment(before, after, id) {
+        let targetId = after.get("providerId", "");
+        let target = targetId != ""
+          ? get(/databases/$(database)/documents/shops/$(shopId)/team/$(targetId)).data : {};
+        return before.get("status", "") == "Accepted" && after.status == before.status &&
+          before.get("providerPreference", "") == "any" && before.get("providerId", "") == "" &&
+          after.providerId is string && after.providerId != "" &&
+          (manager() || (role() == "Service Provider" && after.providerId == request.auth.uid)) &&
+          target.active == true && target.role == "Service Provider" && after.provider == target.name &&
+          (get(/databases/$(database)/documents/shops/$(shopId)/settings/business).data.get("shopType", "team") != "solo" ||
+            after.providerId == get(/databases/$(database)/documents/shops/$(shopId)/settings/business).data.managerProviderId) &&
+          after.reservedProviderId == after.providerId &&
+          after.scheduleId == after.providerId + '_' + before.date &&
+          after.assignedBy == request.auth.uid && after.assignedAt == request.time &&
+          after.updatedAt == request.time &&
+          after.diff(before).affectedKeys().hasOnly([
+            "providerId", "provider", "reservedProviderId", "scheduleId",
+            "assignedBy", "assignedAt", "updatedAt"
+          ]) &&
+          slotsHeld(after, id) &&
+          (before.scheduleId == after.scheduleId ||
+            !getAfter(/databases/$(database)/documents/shops/$(shopId)/appointmentSchedules/$(before.scheduleId)).data.slots.keys().hasAny(before.slotKeys));
+      }
+      // Calendar permissions only need to prove that this atomic request also
+      // assigns the appointment. Its own update rule runs validAssignment(),
+      // including role, target, immutable fields, and every slot's ownership.
+      function assignmentInRequest(before, after) {
+        return before.get("status", "") == "Accepted" &&
+          before.get("providerPreference", "") == "any" &&
+          before.get("providerId", "") == "" &&
+          after.providerId != "" && after.status == "Accepted" &&
+          after.assignedBy == request.auth.uid &&
+          after.assignedAt == request.time && after.updatedAt == request.time;
+      }
+      function validName(value) { return value is string && value.size() >= 2 && value.size() <= 120; }
+      function slotsHeld(data, id) {
+        let calendar = getAfter(/databases/$(database)/documents/shops/$(shopId)/appointmentSchedules/$(data.scheduleId)).data;
+        let slots = calendar.slots;
+        let keys = data.slotKeys;
+        let count = keys.size();
+        // An exact-minute Admin correction can touch 17 blocks at 240 minutes.
+        // New bookings still use validSlotKeys(), which limits creation to 16.
+        return count >= 1 && count <= 17 &&
+          calendar.appointmentId == id && slots.keys().hasAll(keys) &&
+          slots[keys[0]] == id &&
+          (count < 2 || slots[keys[1]] == id) &&
+          (count < 3 || slots[keys[2]] == id) &&
+          (count < 4 || slots[keys[3]] == id) &&
+          (count < 5 || slots[keys[4]] == id) &&
+          (count < 6 || slots[keys[5]] == id) &&
+          (count < 7 || slots[keys[6]] == id) &&
+          (count < 8 || slots[keys[7]] == id) &&
+          (count < 9 || slots[keys[8]] == id) &&
+          (count < 10 || slots[keys[9]] == id) &&
+          (count < 11 || slots[keys[10]] == id) &&
+          (count < 12 || slots[keys[11]] == id) &&
+          (count < 13 || slots[keys[12]] == id) &&
+          (count < 14 || slots[keys[13]] == id) &&
+          (count < 15 || slots[keys[14]] == id) &&
+          (count < 16 || slots[keys[15]] == id) &&
+          (count < 17 || slots[keys[16]] == id);
+      }
+      // Validate ordering only when a booking is created. Slot keys and duration
+      // are immutable afterwards, including during assignment and payment.
+      function validSlotKeys(keys, start) {
+        let count = keys.size();
+        let text = keys.join(',');
+        let expected = [
+          string(start), string(start + 15), string(start + 30), string(start + 45),
+          string(start + 60), string(start + 75), string(start + 90), string(start + 105),
+          string(start + 120), string(start + 135), string(start + 150), string(start + 165),
+          string(start + 180), string(start + 195), string(start + 210), string(start + 225)
+        ].join(',');
+        // Exactly count numeric keys prevents commas/regex characters inside
+        // a key. The second match requires the exact contiguous sequence.
+        return count >= 1 && count <= 16 &&
+          text.matches('^[0-9]+(,[0-9]+){' + string(count - 1) + '}$') &&
+          expected.matches('^' + text + '(,.*)?$');
+      }
+      function newBookingSlotsHeld(data, id) {
+        let calendar = getAfter(/databases/$(database)/documents/shops/$(shopId)/appointmentSchedules/$(data.scheduleId)).data;
+        // The calendar's create branch proves every added value equals this ID.
+        // Checking the same blocks again here unnecessarily doubles rule work.
+        return calendar.updatedAt == request.time && calendar.appointmentId == id &&
+          calendar.slots.keys().hasAll(data.slotKeys) &&
+          validSlotKeys(data.slotKeys, data.startMinute);
+      }
+      function inBusinessHours(data) {
+        let business = get(/databases/$(database)/documents/shops/$(shopId)/settings/business).data;
+        return business.get("bookingSchemaVersion", 0) == 2 &&
+          data.startMinute >= business.get("openingMinute", 0) &&
+          data.startMinute + data.durationMinutes <= business.get("closingMinute", 1440);
+      }
+      function validBooking(data, id) {
+        let menuItem = get(/databases/$(database)/documents/shops/$(shopId)/services/$(data.serviceId)).data;
+        let capacityProviderId = data.get("reservedProviderId", data.providerId);
+        let provider = get(/databases/$(database)/documents/shops/$(shopId)/team/$(capacityProviderId)).data;
+        let dateParts = data.date.split('-');
+        let timeParts = data.time.split(':');
+        let business = get(/databases/$(database)/documents/shops/$(shopId)/settings/business).data;
+        // Required fields are directly accessed and validated below; a missing
+        // field fails closed. Avoid evaluating the same key list twice.
+        return data.keys().hasOnly(["client", "customerId", "serviceId", "service", "providerId", "provider", "date", "time", "startMinute", "startsAt", "durationMinutes", "amount", "scheduleId", "slotKeys", "notes", "status", "paymentStatus", "createdBy", "createdAt", "providerPreference", "reservedProviderId"]) &&
+          data.createdBy == request.auth.uid && data.client is string && data.client.size() >= 2 && data.client.size() <= 120 &&
+          data.customerId is string && data.notes is string && data.notes.size() <= 1000 &&
+          (data.customerId == "" || get(/databases/$(database)/documents/shops/$(shopId)/members/$(data.customerId)).data.role == "Customer") &&
+          data.status == "Pending" && data.paymentStatus == "Unpaid" && data.createdAt == request.time &&
+          data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') && data.time.matches('^[0-9]{2}:[0-9]{2}$') &&
+          data.startMinute is int && data.startMinute >= 0 && data.startMinute % 15 == 0 &&
+          data.startMinute == int(timeParts[0]) * 60 + int(timeParts[1]) &&
+          int(timeParts[0]) < 24 && int(timeParts[1]) < 60 &&
+          data.durationMinutes is int && data.durationMinutes >= 1 && data.durationMinutes <= 240 &&
+          data.startMinute + data.durationMinutes <= 1440 && data.slotKeys is list &&
+          data.slotKeys.size() * 15 >= data.durationMinutes && (data.slotKeys.size() - 1) * 15 < data.durationMinutes &&
+          data.startsAt is timestamp && data.startsAt > request.time &&
+          data.startsAt == timestamp.date(int(dateParts[0]), int(dateParts[1]), int(dateParts[2])) + duration.value(data.startMinute - 480, 'm') &&
+          data.amount is number && data.amount >= 0 && data.amount == menuItem.amount && data.durationMinutes == menuItem.durationMinutes &&
+          menuItem.status == "Active" && data["service"] == menuItem.name && provider.active == true && provider.role == "Service Provider" &&
+          (
+            (data.get("providerPreference", "specific") == "specific" &&
+              !data.keys().hasAny(["reservedProviderId"]) && data.providerId != "" && data.provider == provider.name) ||
+            (data.get("providerPreference", "") == "any" &&
+              data.reservedProviderId is string && data.reservedProviderId != "" &&
+              data.providerId == "" && data.provider == "To be assigned at shop")
+          ) &&
+          (business.get("shopType", "team") != "solo" || capacityProviderId == business.managerProviderId) &&
+          data.scheduleId == capacityProviderId + '_' + data.date &&
+          business.get("bookingSchemaVersion", 0) == 2 &&
+          data.startMinute >= business.get("openingMinute", 0) &&
+          data.startMinute + data.durationMinutes <= business.get("closingMinute", 1440) &&
+          newBookingSlotsHeld(data, id);
+      }
+      function validTransition(before, after) {
+        let changed = after.diff(before).affectedKeys();
+        return (
+          before.status in ["Pending", "Pending Approval"] &&
+          after.status == "Accepted" && manager() &&
+          after.acceptedAt == request.time &&
+          changed.hasOnly(["status", "updatedAt", "acceptedAt"])
+        ) || (
+          before.status in ["Pending", "Pending Approval"] &&
+          after.status == "Rejected" && manager() &&
+          after.rejectedAt == request.time &&
+          after.rejectionReason is string && after.rejectionReason.size() <= 1000 &&
+          changed.hasOnly(["status", "updatedAt", "rejectedAt", "rejectionReason"])
+        ) || (
+          before.status in ["Confirmed", "Accepted"] &&
+          after.status == "In Progress" && before.providerId != "" && (manager() || assigned(before)) &&
+          after.startedAt == request.time &&
+          changed.hasOnly(["status", "updatedAt", "startedAt"])
+        ) || (
+          before.status in ["In Progress", "In Service"] &&
+          after.status == "Completed" && (manager() || assigned(before)) &&
+          after.completedAt == request.time &&
+          changed.hasOnly(["status", "updatedAt", "completedAt"])
+        ) || (
+          before.status in ["Pending", "Pending Approval", "Confirmed", "Accepted"] &&
+          after.status == "Cancelled" &&
+          (manager() || (role() == "Customer" && owner(before))) &&
+          changed.hasOnly(["status", "updatedAt"])
+        ) || (
+          before.status in ["In Progress", "In Service"] &&
+          after.status == "Cancelled" && manager() &&
+          changed.hasOnly(["status", "updatedAt"])
+        );
+      }
+      match /team/{uid} {
+        allow read: if member();
+        allow update: if globalAdministrator() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "updatedAt"]) &&
+          validName(request.resource.data.name) &&
+          request.resource.data.name == getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(uid)).data.name &&
+          request.resource.data.updatedAt == request.time;
+        allow create, update: if signedIn() && uid == request.auth.uid &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(uid)).data.role in ["Manager", "Administrator"] &&
+          request.resource.data.keys().hasOnly(["name", "role", "active", "updatedAt"]) &&
+          validName(request.resource.data.name) &&
+          request.resource.data.name == getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(uid)).data.name &&
+          request.resource.data.role == "Service Provider" && request.resource.data.active is bool &&
+          request.resource.data.updatedAt == request.time &&
+          (manager() || (!exists(/databases/$(database)/documents/shops/$(shopId)) && shopId == uid && getAfter(/databases/$(database)/documents/shops/$(shopId)).data.ownerId == uid));
+        allow create, update: if (manager() &&
+          // New provider membership is created in the same account-provisioning batch.
+          (globalAdministrator() || getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(uid)).data.role != "Customer") &&
+          request.resource.data.keys().hasOnly(["name", "role", "active", "updatedAt"]) &&
+          request.resource.data.role == getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(uid)).data.role &&
+          request.resource.data.name == getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(uid)).data.name &&
+          validRole(request.resource.data.role) && validName(request.resource.data.name) &&
+          request.resource.data.active is bool &&
+          (request.resource.data.role == "Service Provider" || request.resource.data.active == false) &&
+          request.resource.data.updatedAt == request.time) ||
+          (signedIn() && uid == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name"]) && validName(request.resource.data.name) && request.resource.data.name == getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(uid)).data.name);
+        allow delete: if false;
+      }
+      match /services/{id} {
+        function validService() {
+          return validName(request.resource.data.name) &&
+            request.resource.data.category is string && request.resource.data.category.size() > 0 && request.resource.data.category.size() <= 120 &&
+            request.resource.data.amount is number && request.resource.data.amount >= 0 && request.resource.data.durationMinutes is int &&
+            request.resource.data.durationMinutes >= 1 && request.resource.data.durationMinutes <= 240 &&
+            request.resource.data.status in ["Active", "Archived"] &&
+            (request.resource.data.get("imageUrl", "") == "" ||
+              (request.resource.data.imageUrl is string && request.resource.data.imageUrl.matches('^https://res[.]cloudinary[.]com/dijbiwcbo/image/upload/.+$')));
+        }
+        allow read: if member();
+        allow create: if cashier() &&
+          request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time &&
+          request.resource.data.keys().hasOnly(["name", "category", "amount", "durationMinutes", "status", "imageUrl", "imagePublicId", "sourceCatalogId", "createdBy", "createdAt"]) && validService();
+        allow update: if manager() && validService() && request.resource.data.updatedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "category", "amount", "durationMinutes", "status", "imageUrl", "imagePublicId", "sourceCatalogId", "updatedAt"]);
+        allow delete: if false;
+      }
+      match /catalog/{id} { allow read: if member(); allow write: if manager(); }
+      match /clients/{id} {
+        // Staff may maintain walk-in records, never linked customer accounts.
+        function unlinked(data) {
+          return data.get("customerId", "") == "" &&
+            !exists(/databases/$(database)/documents/shops/$(shopId)/members/$(id));
+        }
+        allow get: if cashier() || (signedIn() && id == request.auth.uid);
+        allow list: if cashier();
+        allow create: if signedIn() && id == request.auth.uid && account().role == "Customer" &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(id)).data.role == "Customer" &&
+          request.resource.data.keys().hasOnly(["name", "email", "phone", "customerId", "notes", "createdBy", "createdAt"]) &&
+          request.resource.data.name == account().name && request.resource.data.email == account().email &&
+          request.resource.data.customerId == id && request.resource.data.phone == "" && request.resource.data.notes == "" &&
+          request.resource.data.createdBy == id && request.resource.data.createdAt == request.time;
+        allow update: if member() && id == request.auth.uid && role() == "Customer" && resource.data.customerId == id &&
+          request.resource.data.name == getAfter(/databases/$(database)/documents/users/$(id)).data.name &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "updatedAt"]) &&
+          validName(request.resource.data.name) && request.resource.data.updatedAt == request.time;
+        allow create: if cashier() && (globalAdministrator() || unlinked(request.resource.data)) &&
+          validName(request.resource.data.name) && request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time &&
+          request.resource.data.keys().hasOnly(["name", "email", "phone", "customerId", "notes", "createdBy", "createdAt"]);
+        allow update: if (globalAdministrator() ||
+            (cashier() && unlinked(resource.data) && unlinked(request.resource.data))) &&
+          validName(request.resource.data.name) && request.resource.data.updatedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "email", "phone", "customerId", "notes", "updatedAt"]);
+        allow delete: if globalAdministrator() || (manager() && unlinked(resource.data));
+      }
+      match /appointments/{id} {
+        allow update: if adminRecordCorrection();
+        allow update: if managerBookingDateCorrection(id, resource.data, request.resource.data);
+        allow read: if manager() || owner(resource.data) || assigned(resource.data) || availableForAssignment(resource.data);
+        allow create: if member() && (globalAdministrator() || shopAccessActive(shopId)) && get(/databases/$(database)/documents/shops/$(shopId)).data.active == true &&
+          canCreateBooking(request.resource.data) && validBooking(request.resource.data, id);
+        allow update: if signedIn() && request.resource.data.updatedAt == request.time && (
+          (resource.data.get("providerPreference", "") == "any" &&
+            resource.data.get("providerId", "") == "" &&
+            resource.data.status == "Accepted" &&
+            validAssignment(resource.data, request.resource.data, id)) ||
+          (validTransition(resource.data, request.resource.data) &&
+            (!(request.resource.data.status in ["Cancelled", "Rejected"]) || resource.data.get("scheduleId", "") == "" || !getAfter(/databases/$(database)/documents/shops/$(shopId)/appointmentSchedules/$(resource.data.scheduleId)).data.slots.keys().hasAny(resource.data.slotKeys))) ||
+          (role() == "Customer" && owner(resource.data) && resource.data.status == "Completed" && request.resource.data.status == "Rated" &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "updatedAt", "reviewId", "ratedAt"]) && request.resource.data.reviewId == id && request.resource.data.ratedAt == request.time &&
+            !exists(/databases/$(database)/documents/shops/$(shopId)/reviews/$(id)) &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/reviews/$(id)).data.appointmentId == id &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/reviews/$(id)).data.customerId == request.auth.uid &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/reviews/$(id)).data.providerId == resource.data.providerId &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/reviews/$(id)).data.createdAt == request.time) ||
+          (canCollect(resource.data) && resource.data.status in ["Completed", "Rated"] && resource.data.paymentStatus == "Unpaid" &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(["paymentStatus", "updatedAt"]) && request.resource.data.paymentStatus == "Paid" &&
+            !exists(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)) &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data.amount == resource.data.amount &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data.appointmentId == id &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data.createdBy == request.auth.uid &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data == getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data)
+        );
+        allow delete: if recordDeleter() && ledgersDeleted(id) && bookingSlotsReleased(id, resource.data) &&
+          !existsAfter(/databases/$(database)/documents/shops/$(shopId)/reviews/$(id));
+      }
+      // Direct reads avoid redundant exists/get calls in multi-document payments.
+      function walkInRole() {
+        return signedIn() && (globalAdministrator() || shopAccessActive(shopId)) ? (
+          account().get("role", "") == "Administrator" ? "Administrator" :
+            get(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)).data.get("role", "")
+        ) : "";
+      }
+      function walkInManager() { return signedIn() && walkInRole() in ["Administrator", "Manager"]; }
+      function walkInStaff() { return signedIn() && walkInRole() in ["Administrator", "Manager", "Service Provider"]; }
+      function walkInLineValid(data, index) {
+        return data.serviceIds.size() <= index || (
+          data.serviceIds[index] is string &&
+          data.serviceAmounts[index] is number && data.serviceAmounts[index] >= 0 &&
+          get(/databases/$(database)/documents/shops/$(shopId)/services/$(data.serviceIds[index])).data.status == "Active" &&
+          data.serviceNames[index] == get(/databases/$(database)/documents/shops/$(shopId)/services/$(data.serviceIds[index])).data.name &&
+          data.serviceAmounts[index] == get(/databases/$(database)/documents/shops/$(shopId)/services/$(data.serviceIds[index])).data.amount
+        );
+      }
+      function walkInLineCents(data, index) {
+        return data.serviceIds.size() > index ? int(data.serviceAmounts[index] * 100 + 0.5) : 0;
+      }
+      function walkInLabel(data) {
+        return data.serviceNames[0] +
+          (data.serviceNames.size() > 1 ? " + " + data.serviceNames[1] : "") +
+          (data.serviceNames.size() > 2 ? " + " + data.serviceNames[2] : "") +
+          (data.serviceNames.size() > 3 ? " + " + data.serviceNames[3] : "") +
+          (data.serviceNames.size() > 4 ? " + " + data.serviceNames[4] : "");
+      }
+      // Legacy clients retain their bounded validation until the new app is
+      // published. New clients use one immutable, validated quote step per line.
+      function legacyWalkInPricing(data) {
+        return data.serviceIds.size() <= 5 &&
+          walkInLineValid(data, 0) && walkInLineValid(data, 1) &&
+          walkInLineValid(data, 2) && walkInLineValid(data, 3) && walkInLineValid(data, 4) &&
+          data["service"] == walkInLabel(data) &&
+          data.amountCents == walkInLineCents(data, 0) + walkInLineCents(data, 1) +
+            walkInLineCents(data, 2) + walkInLineCents(data, 3) + walkInLineCents(data, 4);
+      }
+      function quotedWalkInPricing(data, id) {
+        let quote = get(/databases/$(database)/documents/shops/$(shopId)/walkInQuotes/$(data.quoteId)).data;
+        return quote.createdBy == request.auth.uid && quote.walkInId == id &&
+          quote.quotedAt + duration.value(5, 'm') > request.time &&
+          quote.serviceIds == data.serviceIds && quote.serviceNames == data.serviceNames &&
+          quote.serviceAmounts == data.serviceAmounts && quote.amountCents == data.amountCents &&
+          data["service"] == data.serviceNames.join(" + ");
+      }
+      match /walkInQuotes/{id} {
+        function validQuoteStep() {
+          let data = request.resource.data;
+          let item = get(/databases/$(database)/documents/shops/$(shopId)/services/$(data.serviceId)).data;
+          let prior = data.previousQuoteId == "" ? {
+            "serviceIds": [], "serviceNames": [], "serviceAmounts": [], "amountCents": 0,
+            "createdBy": request.auth.uid, "walkInId": data.walkInId, "quotedAt": request.time
+          } : get(/databases/$(database)/documents/shops/$(shopId)/walkInQuotes/$(data.previousQuoteId)).data;
+          return data.keys().hasOnly([
+              "walkInId", "previousQuoteId", "serviceId", "serviceIds", "serviceNames",
+              "serviceAmounts", "amountCents", "createdBy", "createdAt", "quotedAt"
+            ]) &&
+            data.walkInId is string && data.walkInId.matches('^[^/]+$') &&
+            data.previousQuoteId is string && data.previousQuoteId != id &&
+            data.serviceId is string &&
+            data.createdBy == request.auth.uid && data.createdAt == request.time &&
+            prior.createdBy == request.auth.uid && prior.walkInId == data.walkInId &&
+            data.quotedAt == prior.quotedAt && data.quotedAt <= request.time &&
+            data.quotedAt + duration.value(5, 'm') > request.time &&
+            item.status == "Active" && item.amount is number && item.amount >= 0 &&
+            data.serviceIds == prior.serviceIds.concat([data.serviceId]) &&
+            data.serviceIds.toSet().size() == data.serviceIds.size() &&
+            data.serviceNames == prior.serviceNames.concat([item.name]) &&
+            data.serviceAmounts == prior.serviceAmounts.concat([item.amount]) &&
+            data.amountCents is int &&
+            data.amountCents == prior.amountCents + int(item.amount * 100 + 0.5);
+        }
+        allow get: if walkInManager();
+        allow list: if globalAdministrator();
+        allow create: if walkInManager() && validQuoteStep();
+        allow update: if false;
+        allow delete: if globalAdministrator() ||
+          (walkInManager() && resource.data.createdBy == request.auth.uid);
+      }
+      function validWalkInClaim(before, after) {
+        return walkInStaff() && before.status == "Pending" && before.acceptedBy == "" &&
+          after.status == "Accepted" && after.acceptedBy == request.auth.uid &&
+          after.acceptedByName == account().name && after.acceptedAt == request.time &&
+          after.updatedAt == request.time &&
+          (walkInManager() || after.providerId == request.auth.uid) &&
+          (before.requestedProviderId == "" || after.providerId == before.requestedProviderId) &&
+          get(/databases/$(database)/documents/shops/$(shopId)/team/$(after.providerId)).data.active == true &&
+          get(/databases/$(database)/documents/shops/$(shopId)/team/$(after.providerId)).data.role == "Service Provider" &&
+          after.provider == get(/databases/$(database)/documents/shops/$(shopId)/team/$(after.providerId)).data.name &&
+          after.diff(before).affectedKeys().hasOnly([
+            "status", "providerId", "provider", "acceptedBy", "acceptedByName", "acceptedAt", "updatedAt"
+          ]);
+      }
+      match /walkins/{id} {
+        allow update: if adminRecordCorrection() && adminWalkInDetails(resource.data, request.resource.data);
+        allow update: if managerDateCorrection(resource.data, request.resource.data, false) &&
+          managerLinkedDates(id, request.resource.data);
+        allow read: if walkInStaff();
+        // Quotes validate each service price before the atomic visit/receipt
+        // write. The final price check therefore uses one quote read, not N.
+        allow create: if walkInManager() &&
+          request.resource.data.keys().hasOnly([
+            "type", "walkInId", "client", "customerId", "email", "phone",
+            "service", "serviceIds", "serviceNames", "serviceAmounts", "amount", "amountCents",
+            "requestedProviderId", "providerId", "provider", "acceptedBy", "acceptedByName",
+            "status", "paymentStatus", "method", "currency", "date",
+            "createdBy", "createdAt", "updatedAt", "paidAt", "completedAt", "quoteId"
+          ]) &&
+          request.resource.data.type == "Walk-in" && request.resource.data.walkInId == id &&
+          validName(request.resource.data.client) && request.resource.data.customerId == "" &&
+          request.resource.data.email is string && request.resource.data.email.size() <= 254 &&
+          request.resource.data.phone is string && request.resource.data.phone.size() <= 30 &&
+          request.resource.data.serviceIds is list && request.resource.data.serviceIds.size() >= 1 &&
+          request.resource.data.serviceIds.toSet().size() == request.resource.data.serviceIds.size() &&
+          request.resource.data.serviceNames is list && request.resource.data.serviceAmounts is list &&
+          request.resource.data.serviceNames.size() == request.resource.data.serviceIds.size() &&
+          request.resource.data.serviceAmounts.size() == request.resource.data.serviceIds.size() &&
+          request.resource.data["service"] is string &&
+          request.resource.data.amountCents is int && request.resource.data.amountCents >= 0 &&
+          (request.resource.data.keys().hasAny(["quoteId"])
+            ? quotedWalkInPricing(request.resource.data, id)
+            : legacyWalkInPricing(request.resource.data)) &&
+          request.resource.data.amount == request.resource.data.amountCents / 100.0 &&
+          request.resource.data.requestedProviderId is string &&
+          request.resource.data.requestedProviderId.size() > 0 &&
+          request.resource.data.providerId == request.resource.data.requestedProviderId &&
+          request.resource.data.acceptedBy == "" && request.resource.data.acceptedByName == "" &&
+          request.resource.data.status == "Paid" && request.resource.data.paymentStatus == "Paid" &&
+          request.resource.data.method in ["Cash", "E-wallet"] &&
+          request.resource.data.currency == "PHP" && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+          request.resource.data.createdBy == request.auth.uid &&
+          request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time &&
+          request.resource.data.paidAt == request.time && request.resource.data.completedAt == request.time &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data.walkInId == id &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data.amount == request.resource.data.amount &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data ==
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data;
+        allow update: if (
+          validWalkInClaim(resource.data, request.resource.data) &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data.providerId == request.resource.data.providerId &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data ==
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data
+        ) || (
+          walkInStaff() && (walkInManager() || resource.data.providerId == request.auth.uid) &&
+          request.resource.data.updatedAt == request.time &&
+          (
+            (resource.data.status == "Accepted" && request.resource.data.status == "In Service" &&
+              request.resource.data.startedAt == request.time &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "startedAt", "updatedAt"])) ||
+            (resource.data.status == "In Service" && request.resource.data.status == "Paid" &&
+              resource.data.paymentStatus == "Paid" && request.resource.data.completedAt == request.time &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "completedAt", "updatedAt"]))
+          )
+        );
+        allow delete: if recordDeleter() && ledgersDeleted(id);
+      }
+      match /appointmentSchedules/{id} {
+        function recordDeletionRelease() {
+          let data = request.resource.data;
+          let removed = resource.data.slots.keys().removeAll(data.slots.keys());
+          return recordDeleter() &&
+            data.keys().hasOnly(["slots", "appointmentId", "updatedAt"]) &&
+            data.appointmentId is string && data.updatedAt == request.time && data.slots is map &&
+            !existsAfter(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId)) &&
+            data.slots.diff(resource.data.slots).addedKeys().size() == 0 &&
+            data.slots.diff(resource.data.slots).changedKeys().size() == 0 &&
+            (removed.size() == 0 || managerOwnsSlots(resource.data.slots, removed, data.appointmentId)) &&
+            !data.slots.values().hasAny([data.appointmentId]);
+        }
+        allow update: if recordDeletionRelease();
+        function adminScheduleCorrection(oldSlots) {
+          let data = request.resource.data;
+          let booking = appointment(data.appointmentId);
+          let before = get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId)).data;
+          // Ordinary status/checkout writes must bypass this exceptional path
+          // before ownership and scheduling checks consume their rules budget.
+          return booking.get("editedByAdmin", "") == request.auth.uid &&
+            booking.get("adminEditedAt", null) == request.time &&
+            recordEditor() && recordTimeUnchanged(before, booking) &&
+            data.keys().hasOnly(["slots", "appointmentId", "updatedAt"]) &&
+            data.updatedAt == request.time && data.slots is map &&
+            (id == before.get("scheduleId", "") || id == booking.scheduleId) &&
+            data.slots.diff(oldSlots).affectedKeys().hasOnly(before.get("slotKeys", []).concat(booking.slotKeys)) &&
+            oldSlots.values().removeAll(data.slots.values()).toSet().hasOnly([data.appointmentId]) &&
+            data.slots.values().removeAll(oldSlots.values()).toSet().hasOnly([data.appointmentId]);
+        }
+        allow create: if adminScheduleCorrection({});
+        allow update: if adminScheduleCorrection(resource.data.slots);
+        function managerScheduleDateCorrection(oldSlots) {
+          let data = request.resource.data;
+          let before = get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId)).data;
+          let after = appointment(data.appointmentId);
+          return managerDateCorrection(before, after, true) &&
+            !(before.status in ["Cancelled", "Rejected"]) &&
+            before.get("scheduleId", "") != "" &&
+            data.keys().hasOnly(["slots", "appointmentId", "updatedAt"]) &&
+            data.updatedAt == request.time && data.slots is map &&
+            (id == before.scheduleId || id == after.scheduleId) &&
+            data.slots.diff(oldSlots).changedKeys().size() == 0 &&
+            data.slots.diff(oldSlots).addedKeys().hasOnly(id == after.scheduleId ? after.slotKeys : []) &&
+            data.slots.diff(oldSlots).removedKeys().hasOnly(id == before.scheduleId ? before.slotKeys : []) &&
+            (id != before.scheduleId || (
+              managerOwnsSlots(oldSlots, before.slotKeys, data.appointmentId) &&
+              !data.slots.keys().hasAny(before.slotKeys.removeAll(id == after.scheduleId ? after.slotKeys : []))
+            )) &&
+            (id != after.scheduleId || data.slots.keys().hasAll(after.slotKeys));
+        }
+        allow create: if managerScheduleDateCorrection({});
+        allow update: if managerScheduleDateCorrection(resource.data.slots);
+        function scheduleChange(oldSlots) {
+          let data = request.resource.data;
+          let booking = appointment(data.appointmentId);
+          let before = exists(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId))
+            ? get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId)).data : {};
+          let newValues = data.slots.values().removeAll(oldSlots.values());
+          return data.keys().hasOnly(["slots", "appointmentId", "updatedAt"]) && data.updatedAt == request.time &&
+            data.slots is map && data.slots.diff(oldSlots).affectedKeys().hasOnly(booking.slotKeys) && (
+              (!exists(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId)) && booking.scheduleId == id && booking.createdBy == request.auth.uid && booking.status == "Pending" && !oldSlots.keys().hasAny(booking.slotKeys) && newValues.size() == booking.slotKeys.size() && newValues.toSet().hasOnly([data.appointmentId])) ||
+              (booking.status in ["Cancelled", "Rejected"] &&
+                booking.scheduleId == id &&
+                booking.updatedAt == request.time &&
+                validTransition(get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId)).data, booking) &&
+                !data.slots.keys().hasAny(booking.slotKeys)) ||
+              (assignmentInRequest(before, booking) &&
+                ((id == booking.scheduleId &&
+                    ((id == before.scheduleId && data.slots == oldSlots) ||
+                      (id != before.scheduleId && !oldSlots.keys().hasAny(booking.slotKeys) &&
+                        newValues.size() == booking.slotKeys.size() &&
+                        newValues.toSet().hasOnly([data.appointmentId])))) ||
+                  (id == before.scheduleId && id != booking.scheduleId && !data.slots.keys().hasAny(booking.slotKeys))))
+            );
+        }
+        allow read: if member();
+        allow create: if member() && scheduleChange({});
+        allow update: if member() && scheduleChange(resource.data.slots);
+        allow delete: if false;
+      }
+      match /{collectionName}/{id} {
+        function validWalkInReceipt() {
+          let data = request.resource.data;
+          let visit = getAfter(/databases/$(database)/documents/shops/$(shopId)/walkins/$(id)).data;
+          return walkInManager() &&
+            !exists(/databases/$(database)/documents/shops/$(shopId)/walkins/$(id)) &&
+            get(/databases/$(database)/documents/shops/$(shopId)).data.active == true &&
+            data.keys().hasOnly([
+              "type", "walkInId", "client", "customerId", "service", "serviceIds",
+              "providerId", "provider", "amount", "amountCents", "method", "status",
+              "currency", "date", "createdBy", "createdAt"
+            ]) &&
+            data.type == "Walk-in" && data.walkInId == id &&
+            data.client == visit.client && data.customerId == "" &&
+            data["service"] == visit["service"] && data.serviceIds == visit.serviceIds &&
+            data.providerId == visit.providerId && data.provider == visit.provider &&
+            data.providerId is string && data.providerId.size() > 0 &&
+            get(/databases/$(database)/documents/shops/$(shopId)/team/$(data.providerId)).data.active == true &&
+            get(/databases/$(database)/documents/shops/$(shopId)/team/$(data.providerId)).data.role == "Service Provider" &&
+            data.provider == get(/databases/$(database)/documents/shops/$(shopId)/team/$(data.providerId)).data.name &&
+            data.method in ["Cash", "E-wallet"] &&
+            (get(/databases/$(database)/documents/shops/$(shopId)/settings/business).data.get("shopType", "team") != "solo" ||
+              data.providerId == get(/databases/$(database)/documents/shops/$(shopId)/settings/business).data.managerProviderId) &&
+            data.amount == visit.amount && data.amountCents == visit.amountCents &&
+            data.method == visit.method && data.status == "Paid" && data.currency == "PHP" &&
+            data.date == visit.date && data.createdBy == request.auth.uid &&
+            data.createdAt == request.time && visit.createdBy == request.auth.uid &&
+            visit.createdAt == request.time && visit.paymentStatus == "Paid" &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data ==
+              getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data;
+        }
+        function validCheckout() {
+          let data = request.resource.data;
+          let booking = appointment(id);
+          let before = get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(id)).data;
+          return data.keys().hasOnly(["appointmentId", "client", "customerId", "service", "providerId", "provider", "amount", "method", "status", "currency", "date", "createdBy", "createdAt"]) &&
+            canCollect(before) && before.status in ["Completed", "Rated"] && before.paymentStatus == "Unpaid" &&
+            !exists(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)) && !exists(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)) &&
+            data.appointmentId == id && booking.status == before.status && booking.paymentStatus == "Paid" &&
+            data.createdBy == request.auth.uid && data.createdAt == request.time && data.amount == booking.amount &&
+            data.customerId == booking.customerId && data.providerId == booking.providerId && data.provider == booking.provider &&
+            data.client == booking.client && data["service"] == booking["service"] && data.date == booking.date &&
+            data.currency == "PHP" && data.status == "Paid" && data.method in ["Cash", "GCash", "Card", "Bank transfer"] &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data == getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data;
+        }
+        function managerReceiptDateCorrection() {
+          let data = request.resource.data;
+          let bookingId = resource.data.get("appointmentId", "");
+          let walkInId = resource.data.get("walkInId", "");
+          return managerDateCorrection(resource.data, data, false) &&
+            managerLinkedDates(id, data) &&
+            (bookingId == "" || (
+              getAfter(/databases/$(database)/documents/shops/$(shopId)/appointments/$(bookingId)).data.date == data.date &&
+              getAfter(/databases/$(database)/documents/shops/$(shopId)/appointments/$(bookingId)).data.dateEditedAt == request.time
+            )) &&
+            (walkInId == "" || (
+              getAfter(/databases/$(database)/documents/shops/$(shopId)/walkins/$(walkInId)).data.date == data.date &&
+              getAfter(/databases/$(database)/documents/shops/$(shopId)/walkins/$(walkInId)).data.dateEditedAt == request.time
+            ));
+        }
+        allow read: if collectionName in ["sales", "payments"] &&
+          (manager() || (role() == "Customer" && owner(resource.data)));
+        allow delete: if collectionName in ["sales", "payments"] && recordDeleter() &&
+          ledgersDeleted(id) &&
+          (resource.data.get("appointmentId", "") == "" ||
+            !existsAfter(/databases/$(database)/documents/shops/$(shopId)/appointments/$(resource.data.appointmentId))) &&
+          (resource.data.get("walkInId", "") == "" ||
+            !existsAfter(/databases/$(database)/documents/shops/$(shopId)/walkins/$(resource.data.walkInId)));
+        allow update: if collectionName in ["sales", "payments"] && adminRecordCorrection() &&
+          (resource.data.get("type", "") != "Walk-in" || adminWalkInDetails(resource.data, request.resource.data));
+        allow update: if collectionName in ["sales", "payments"] && managerReceiptDateCorrection();
+        allow create: if collectionName in ["sales", "payments"] &&
+          request.resource.data.get("type", "Booking") == "Booking" && validCheckout();
+        allow create: if collectionName in ["sales", "payments"] &&
+          request.resource.data.get("type", "Booking") == "Walk-in" && validWalkInReceipt();
+        allow update: if collectionName in ["sales", "payments"] && manager() && resource.data.get("type", "") == "Walk-in" &&
+          validWalkInClaim(
+            get(/databases/$(database)/documents/shops/$(shopId)/walkins/$(id)).data,
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/walkins/$(id)).data
+          ) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["providerId", "provider", "updatedAt"]) &&
+          request.resource.data.updatedAt == request.time &&
+          request.resource.data.providerId == getAfter(/databases/$(database)/documents/shops/$(shopId)/walkins/$(id)).data.providerId &&
+          request.resource.data.provider == getAfter(/databases/$(database)/documents/shops/$(shopId)/walkins/$(id)).data.provider &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(id)).data ==
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/sales/$(id)).data;
+      }
+      match /payroll/{id} {
+        allow read: if manager() || (signedIn() && role() == "Service Provider" && resource.data.providerId == request.auth.uid);
+        allow create: if manager() && request.resource.data.keys().hasOnly(["providerId", "provider", "start", "end", "base", "net", "baseCents", "netCents", "status", "createdBy", "createdAt"]) &&
+          request.resource.data.providerId is string && request.resource.data.net is number && request.resource.data.net >= 0 &&
+          get(/databases/$(database)/documents/shops/$(shopId)/team/$(request.resource.data.providerId)).data.role == "Service Provider" &&
+          get(/databases/$(database)/documents/shops/$(shopId)/team/$(request.resource.data.providerId)).data.active == true &&
+          request.resource.data.provider == get(/databases/$(database)/documents/shops/$(shopId)/team/$(request.resource.data.providerId)).data.name &&
+          request.resource.data.start.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') && request.resource.data.end.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') && request.resource.data.start <= request.resource.data.end &&
+          request.resource.data.status == "Recorded" && request.resource.data.createdAt == request.time &&
+          request.resource.data.base is number && request.resource.data.base >= 0 &&
+          request.resource.data.baseCents is int && request.resource.data.baseCents >= 0 && request.resource.data.netCents is int &&
+          request.resource.data.netCents == request.resource.data.baseCents &&
+          request.resource.data.base == request.resource.data.baseCents / 100.0 && request.resource.data.net == request.resource.data.netCents / 100.0 &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/payrollPeriods/$(request.resource.data.providerId)).data.periods[id].start == request.resource.data.start &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/payrollPeriods/$(request.resource.data.providerId)).data.periods[id].end == request.resource.data.end && request.resource.data.createdBy == request.auth.uid;
+        allow update, delete: if false;
+      }
+      match /payrollPeriods/{id} {
+        allow read: if manager();
+        allow create: if manager() && request.resource.data.keys().hasOnly(["periods", "updatedAt"]) && request.resource.data.periods is map && request.resource.data.periods.size() == 1 && request.resource.data.updatedAt == request.time;
+        allow update: if manager() && request.resource.data.keys().hasOnly(["periods", "updatedAt"]) && request.resource.data.periods is map && request.resource.data.updatedAt == request.time &&
+          request.resource.data.periods.diff(resource.data.periods).removedKeys().size() == 0 &&
+          request.resource.data.periods.diff(resource.data.periods).changedKeys().size() == 0 &&
+          request.resource.data.periods.diff(resource.data.periods).addedKeys().size() == 1;
+        allow delete: if false;
+      }
+      match /settings/{id} {
+        function planName(plan) {
+          return plan == "starter" ? "Starter" : plan == "professional" ? "Professional" : "Business";
+        }
+        function planAmount(plan) {
+          return plan == "starter" ? 99 : plan == "professional" ? 399 : 599;
+        }
+        function validAdminSubscription() {
+          let data = request.resource.data;
+          let access = getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/access).data;
+          return globalAdministrator() &&
+            data.keys().hasOnly(["planId", "plan", "amount", "currency", "billingCycle", "status",
+              "currentPeriodStart", "currentPeriodEnd", "manualLocked", "lockReason",
+              "paymentMethod", "reference", "updatedBy", "updatedAt"]) &&
+            data.planId in ["starter", "professional", "business"] &&
+            data.plan == planName(data.planId) && data.amount == planAmount(data.planId) &&
+            data.currency == "PHP" && data.billingCycle == "month" &&
+            data.status in ["Active", "Expired"] &&
+            data.currentPeriodStart == request.time && data.currentPeriodEnd is timestamp &&
+            data.manualLocked is bool && data.lockReason is string && data.lockReason.size() <= 500 &&
+            data.paymentMethod in ["GCash", "Administrator"] && data.reference is string &&
+            data.updatedAt == request.time && data.updatedBy == request.auth.uid &&
+            access.planId == data.planId && access.expiresAt == data.currentPeriodEnd &&
+            access.manualLocked == data.manualLocked && access.reason == data.lockReason &&
+            access.updatedAt == request.time;
+        }
+        function validAccessReflection() {
+          let data = request.resource.data;
+          let sub = getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data;
+          let end = sub.get("currentPeriodEnd", sub.get("trialStartedAt", request.time) + duration.value(7, 'd'));
+          return billingManager() &&
+            data.keys().hasOnly(["planId", "status", "trialStartedAt", "expiresAt", "manualLocked", "reason", "updatedBy", "updatedAt"]) &&
+            data.planId == sub.planId && data.planId in ["starter", "professional", "business"] &&
+            data.manualLocked == sub.get("manualLocked", false) &&
+            data.reason == sub.get("lockReason", "") &&
+            data.updatedBy == request.auth.uid && data.updatedAt == request.time &&
+            (
+              (sub.status == "Trial" && data.status == "Trial" && data.trialStartedAt == sub.trialStartedAt &&
+                !data.keys().hasAny(["expiresAt"])) ||
+              (sub.status != "Trial" && data.expiresAt == end &&
+                data.status == (sub.status == "Active" ? "Active" : "Locked") &&
+                !data.keys().hasAny(["trialStartedAt"]))
+            );
+        }
+        function validAdminAccess() {
+          let data = request.resource.data;
+          let sub = getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data;
+          return globalAdministrator() &&
+            data.keys().hasOnly(["planId", "status", "expiresAt", "manualLocked", "reason", "updatedBy", "updatedAt"]) &&
+            data.planId == sub.planId && data.status in ["Active", "Locked"] &&
+            data.status == (sub.status == "Active" ? "Active" : "Locked") &&
+            data.expiresAt == sub.currentPeriodEnd && data.manualLocked == sub.manualLocked &&
+            data.reason == sub.lockReason && data.updatedAt == request.time && data.updatedBy == request.auth.uid &&
+            sub.updatedAt == request.time;
+        }
+        allow create, update: if id == "subscription" && validAdminSubscription();
+        allow create: if id == "access" && (validAccessReflection() || validAdminAccess());
+        allow update: if id == "access" && validAdminAccess();
+        function validSmsSettings() {
+          let data = request.resource.data;
+          return data.keys().hasAll(["number", "enabledAt", "updatedAt"]) &&
+            data.keys().hasOnly(["number", "enabledAt", "updatedAt"]) &&
+            data.number is string &&
+            (data.number == "" || data.number.matches('^639[0-9]{9}$')) &&
+            data.enabledAt is timestamp &&
+            data.enabledAt <= request.time &&
+            data.updatedAt == request.time;
+        }
+        // Not readable by customers or providers; SMS credentials stay in the Worker.
+        allow create: if id == "sms" && manager() && validSmsSettings() &&
+          request.resource.data.enabledAt == request.time;
+        allow update: if id == "sms" && manager() && validSmsSettings() &&
+          request.resource.data.enabledAt ==
+            (resource.data.number != "" ? resource.data.enabledAt : request.time);
+        function validShopConfiguration() {
+          let data = request.resource.data;
+          let type = data.get("shopType", "team");
+          let providerId = data.get("managerProviderId", "");
+          return type in ["team", "solo"] &&
+            data.get("facebookUrl", "") is string &&
+            data.get("facebookUrl", "").size() <= 2000 &&
+            (
+              data.get("facebookUrl", "") == "" ||
+              data.get("facebookUrl", "").matches('^https://(www[.]|m[.]|web[.])?facebook[.]com(/.*)?$') ||
+              data.get("facebookUrl", "").matches('^https://fb[.]me(/.*)?$')
+            ) &&
+            data.get("managerWorksAsBarber", false) is bool &&
+            data.get("barberAvailable", true) is bool &&
+            data.get("onboardingComplete", true) is bool &&
+            data.get("barberBio", "") is string &&
+            data.get("barberBio", "").size() <= 1000 &&
+            data.get("barberPortfolio", "") is string &&
+            data.get("barberPortfolio", "").size() <= 2000 &&
+            (data.get("barberPortfolio", "") == "" ||
+              data.get("barberPortfolio", "").matches('^https?://.+$')) &&
+            providerId is string &&
+            (providerId == "" || getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(providerId)).data.role in ["Manager", "Administrator"]) &&
+            (type != "solo" || (
+              providerId != "" &&
+              data.get("managerWorksAsBarber", false) == true &&
+              getAfter(/databases/$(database)/documents/shops/$(shopId)/team/$(providerId)).data.role == "Service Provider"
+            ));
+        }
+        function initialShopOwner() {
+          return signedIn() && shopId == request.auth.uid &&
+            !exists(/databases/$(database)/documents/shops/$(shopId)) &&
+            account().role in ["Administrator", "Manager"] &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)).data.ownerId == request.auth.uid &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/members/$(request.auth.uid)).data.role == account().role;
+        }
+        function validStarterTrial() {
+          let data = request.resource.data;
+          let trial = getAfter(/databases/$(database)/documents/shops/$(shopId)/subscriptionTrials/starter).data;
+          return id == "subscription" && billingManager() &&
+            !exists(/databases/$(database)/documents/shops/$(shopId)/subscriptionTrials/starter) &&
+            data.keys().hasOnly(["amount", "billingCycle", "currency", "normalAmount", "paymentMethod", "plan", "planId", "startedBy", "status", "trialDays", "trialStartedAt", "updatedAt"]) &&
+            data.amount == 0 && data.billingCycle == "month" && data.currency == "PHP" && data.normalAmount == 99 &&
+            data.paymentMethod == "Free trial" && data.plan == "Starter" && data.planId == "starter" &&
+            data.startedBy == request.auth.uid && data.status == "Trial" && data.trialDays == 7 &&
+            data.trialStartedAt == request.time && data.updatedAt == request.time &&
+            trial.planId == "starter" && trial.startedBy == request.auth.uid && trial.startedAt == request.time;
+        }
+        // Billing must remain readable even when operational membership is locked.
+        // The client listens to these exact documents, never a settings-wide query.
+        allow get: if (id == "access" && rawMember()) ||
+          (id in ["subscription", "business"] && billingManager()) ||
+          (id == "business" && member()) || manager();
+        allow list: if manager();
+        allow create: if validStarterTrial();
+        allow create, update: if (manager() || initialShopOwner()) && id == "business" && validName(request.resource.data.name) && request.resource.data.updatedAt == request.time && request.resource.data.currency == "PHP" && request.resource.data.timezone == "Asia/Manila" &&
+          validShopConfiguration() &&
+          request.resource.data.bookingSchemaVersion == 2 &&
+          request.resource.data.openingMinute is int && request.resource.data.closingMinute is int && request.resource.data.openingMinute >= 0 && request.resource.data.closingMinute <= 1440 && request.resource.data.openingMinute < request.resource.data.closingMinute &&
+          request.resource.data.open.matches('^[0-9]{2}:[0-9]{2}$') && request.resource.data.close.matches('^[0-9]{2}:[0-9]{2}$') &&
+          int(request.resource.data.open.split(':')[0]) < 24 && int(request.resource.data.open.split(':')[1]) < 60 && int(request.resource.data.close.split(':')[0]) < 24 && int(request.resource.data.close.split(':')[1]) < 60 &&
+          request.resource.data.openingMinute == int(request.resource.data.open.split(':')[0]) * 60 + int(request.resource.data.open.split(':')[1]) &&
+          request.resource.data.closingMinute == int(request.resource.data.close.split(':')[0]) * 60 + int(request.resource.data.close.split(':')[1]);
+        allow delete: if false;
+      }
+      match /subscriptionPayments/{id} {
+        allow read: if billingManager();
+        allow create: if globalAdministrator() &&
+          request.resource.data.keys().hasOnly(["requestId", "reference", "planId", "plan", "amount", "currency",
+            "paymentMethod", "status", "submittedBy", "approvedBy", "paidAt", "currentPeriodEnd"]) &&
+          request.resource.data.requestId == id && request.resource.data.reference == id &&
+          request.resource.data.approvedBy == request.auth.uid && request.resource.data.paidAt == request.time &&
+          request.resource.data.status == "Paid" && request.resource.data.currency == "PHP" &&
+          request.resource.data.paymentMethod == "GCash" &&
+          get(/databases/$(database)/documents/shops/$(shopId)/subscriptionPaymentRequests/$(id)).data.status == "Pending" &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/subscriptionPaymentRequests/$(id)).data.status == "Approved" &&
+          request.resource.data.planId == get(/databases/$(database)/documents/shops/$(shopId)/subscriptionPaymentRequests/$(id)).data.planId &&
+          request.resource.data.plan == get(/databases/$(database)/documents/shops/$(shopId)/subscriptionPaymentRequests/$(id)).data.plan &&
+          get(/databases/$(database)/documents/subscriptionReferences/$(id)).data.shopId == shopId &&
+          get(/databases/$(database)/documents/subscriptionReferences/$(id)).data.submittedBy ==
+            request.resource.data.submittedBy &&
+          request.resource.data.amount == get(/databases/$(database)/documents/shops/$(shopId)/subscriptionPaymentRequests/$(id)).data.amount &&
+          request.resource.data.submittedBy == get(/databases/$(database)/documents/shops/$(shopId)/subscriptionPaymentRequests/$(id)).data.submittedBy &&
+          request.resource.data.currentPeriodEnd == getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data.currentPeriodEnd;
+        allow update, delete: if false;
+      }
+      match /subscriptionPaymentRequests/{id} {
+        function validRequest() {
+          let data = request.resource.data;
+          let plan = data.planId;
+          return billingManager() &&
+            data.keys().hasOnly(["shopId", "planId", "plan", "amount", "currency", "paymentMethod", "status",
+              "submittedBy", "submittedByName", "transactionReference", "receiptUrl", "receiptPublicId", "createdAt"]) &&
+            plan in ["starter", "professional", "business"] &&
+            data.plan == (plan == "starter" ? "Starter" : plan == "professional" ? "Professional" : "Business") &&
+            data.amount == (plan == "starter" ? 99 : plan == "professional" ? 399 : 599) &&
+            data.shopId == shopId && data.currency == "PHP" && data.paymentMethod == "GCash" &&
+            data.status == "Pending" && data.submittedBy == request.auth.uid &&
+            data.submittedByName == account().name && data.createdAt == request.time &&
+            data.transactionReference == id && id.matches('^[A-Z0-9-]{6,40}$') &&
+            data.receiptUrl.matches('^https://res[.]cloudinary[.]com/dijbiwcbo/image/upload/[^ ?#]+$') &&
+            data.receiptPublicId is string && data.receiptPublicId.size() > 0 && data.receiptPublicId.size() <= 300 &&
+            !exists(/databases/$(database)/documents/subscriptionReferences/$(id)) &&
+            getAfter(/databases/$(database)/documents/subscriptionReferences/$(id)).data.shopId == shopId &&
+            getAfter(/databases/$(database)/documents/subscriptionReferences/$(id)).data.submittedBy == request.auth.uid;
+        }
+        allow read: if billingManager();
+        allow create: if validRequest();
+        allow update: if globalAdministrator() && resource.data.status == "Pending" &&
+          request.resource.data.status in ["Approved", "Rejected"] &&
+          request.resource.data.updatedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "status", "approvedBy", "approvedAt", "reviewedBy", "rejectionReason", "updatedAt"
+          ]) &&
+          (
+            (request.resource.data.status == "Approved" && request.resource.data.approvedBy == request.auth.uid &&
+              request.resource.data.approvedAt == request.time &&
+              getAfter(/databases/$(database)/documents/shops/$(shopId)/subscriptionPayments/$(id)).data.approvedBy == request.auth.uid) ||
+            (request.resource.data.status == "Rejected" && request.resource.data.reviewedBy == request.auth.uid &&
+              request.resource.data.rejectionReason is string && request.resource.data.rejectionReason.size() > 0 &&
+              request.resource.data.rejectionReason.size() <= 500)
+          );
+        allow delete: if false;
+      }
+      match /subscriptionEvents/{id} {
+        allow read: if globalAdministrator();
+        allow create: if globalAdministrator() &&
+          request.resource.data.keys().hasOnly(["action", "planId", "expiresAt", "manualLocked", "reason", "reference", "actorId", "createdAt"]) &&
+          request.resource.data.actorId == request.auth.uid && request.resource.data.createdAt == request.time &&
+          request.resource.data.planId == getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data.planId &&
+          request.resource.data.expiresAt == getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data.currentPeriodEnd &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data.updatedAt == request.time;
+        allow update, delete: if false;
+      }
+      match /subscriptionTrials/{id} {
+        allow read: if billingManager();
+        allow create: if billingManager() && id == "starter" &&
+          !exists(/databases/$(database)/documents/shops/$(shopId)/settings/subscription) &&
+          request.resource.data.keys().hasOnly(["planId", "startedAt", "startedBy", "startedByName"]) &&
+          request.resource.data.planId == "starter" && request.resource.data.startedAt == request.time &&
+          request.resource.data.startedBy == request.auth.uid &&
+          request.resource.data.startedByName == account().name &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data.status == "Trial" &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data.trialDays == 7 &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data.trialStartedAt == request.time &&
+          getAfter(/databases/$(database)/documents/shops/$(shopId)/settings/subscription).data.startedBy == request.auth.uid;
+        allow update, delete: if false;
+      }
+      match /notifications/{id} {
+        function acceptedProviderNotification() {
+          let data = request.resource.data;
+          let before = get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId)).data;
+          let after = appointment(data.appointmentId);
+          return manager() &&
+            before.status in ["Pending", "Pending Approval"] &&
+            after.status == "Accepted" && after.acceptedAt == request.time &&
+            after.updatedAt == request.time && after.get("providerId", "") != "" &&
+            data.userId == after.providerId &&
+            exists(/databases/$(database)/documents/shops/$(shopId)/members/$(data.userId)) &&
+            get(/databases/$(database)/documents/shops/$(shopId)/team/$(data.userId)).data.role == "Service Provider";
+        }
+        // The appointment's update rule validates authorization and immutable
+        // fields. Do not repeat that full rule for the paired notification.
+        function transitionNotification() {
+          let data = request.resource.data;
+          let before = get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(data.appointmentId)).data;
+          let after = appointment(data.appointmentId);
+          return data.userId == before.customerId &&
+            after.customerId == before.customerId && after.updatedAt == request.time &&
+            (
+              (before.status in ["Pending", "Pending Approval"] && after.status in ["Accepted", "Rejected"]) ||
+              (before.status in ["Confirmed", "Accepted"] && after.status == "In Progress") ||
+              (before.status in ["In Progress", "In Service"] && after.status == "Completed") ||
+              (before.status in ["Pending", "Pending Approval", "Confirmed", "Accepted", "In Progress", "In Service"] && after.status == "Cancelled")
+            );
+        }
+        allow read: if administrator() || (member() && resource.data.userId == request.auth.uid);
+        allow update: if (administrator() || (member() && resource.data.userId == request.auth.uid)) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["read"]) && request.resource.data.read == true;
+        allow create: if member() &&
+          request.resource.data.keys().hasAll(["userId", "title", "message", "read", "appointmentId", "createdAt"]) &&
+          request.resource.data.keys().hasOnly(["userId", "title", "message", "read", "appointmentId", "createdAt"]) &&
+          request.resource.data.userId is string && request.resource.data.userId.size() > 0 &&
+          request.resource.data.appointmentId is string && request.resource.data.appointmentId.size() > 0 &&
+          request.resource.data.title is string && request.resource.data.title.size() > 0 && request.resource.data.title.size() <= 120 &&
+          request.resource.data.message is string && request.resource.data.message.size() <= 1000 &&
+          request.resource.data.read == false && request.resource.data.createdAt == request.time &&
+          (request.resource.data.userId == request.auth.uid || acceptedProviderNotification() || (manager() &&
+            request.resource.data.userId == appointment(request.resource.data.appointmentId).customerId && appointment(request.resource.data.appointmentId).createdBy == request.auth.uid && appointment(request.resource.data.appointmentId).createdAt == request.time) || transitionNotification() || (cashier() &&
+            request.resource.data.userId == appointment(request.resource.data.appointmentId).customerId &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(request.resource.data.appointmentId)).data.createdBy == request.auth.uid &&
+            getAfter(/databases/$(database)/documents/shops/$(shopId)/payments/$(request.resource.data.appointmentId)).data.createdAt == request.time));
+        allow delete: if administrator() || (member() && resource.data.userId == request.auth.uid);
+      }
+      // Server-only SMS state. The Cloudflare service account uses IAM.
+      match /smsDeliveries/{id} { allow read, write: if false; }
+      match /smsWorkerState/{id} { allow read, write: if false; }
+      match /{document=**} { allow read, write: if false; }
+      match /promotions/{id} {
+        allow read: if member();
+        allow create, update: if shopManager() && request.resource.data.title is string && request.resource.data.description is string;
+        allow delete: if shopManager();
+      }
+      match /reviews/{id} {
+        function validReview() {
+          let data = request.resource.data;
+          let before = get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(id)).data;
+          let after = appointment(id);
+          let fields = ["appointmentId", "customerId", "providerId", "serviceId", "serviceRating", "providerRating", "rating", "comment", "createdBy", "createdAt"];
+          return data.keys().hasAll(fields) && data.keys().hasOnly(fields) &&
+            data.appointmentId == id && data.customerId == request.auth.uid &&
+            data.createdBy == request.auth.uid && data.createdAt == request.time &&
+            data.serviceRating is int && data.serviceRating >= 1 && data.serviceRating <= 5 &&
+            data.rating == data.serviceRating &&
+            data.providerRating is int && data.providerRating >= 1 && data.providerRating <= 5 &&
+            data.providerId is string && data.providerId.size() > 0 && data.providerId == before.providerId &&
+            data.serviceId is string && data.serviceId == before.get("serviceId", "") &&
+            data.comment is string && data.comment.size() <= 1000 &&
+            before.customerId == request.auth.uid && before.status == "Completed" &&
+            after.status == "Rated" && after.reviewId == id &&
+            after.ratedAt == request.time && after.updatedAt == request.time;
+        }
+        allow get: if member() && (
+          manager() ||
+          (role() == "Customer" &&
+            exists(/databases/$(database)/documents/shops/$(shopId)/appointments/$(id)) &&
+            get(/databases/$(database)/documents/shops/$(shopId)/appointments/$(id)).data.customerId == request.auth.uid) ||
+          (role() == "Customer" && owner(resource.data)) ||
+          assigned(resource.data)
+        );
+        allow list: if member() && (
+          manager() ||
+          (role() == "Customer" && owner(resource.data)) ||
+          assigned(resource.data)
+        );
+        allow create: if member() && role() == "Customer" && validReview();
+        allow delete: if recordDeleter() &&
+          !existsAfter(/databases/$(database)/documents/shops/$(shopId)/appointments/$(id)) &&
+          ledgersDeleted(id);
+        allow update: if false;
+      }
+    }
+    match /feedback/{id} {
+      allow read: if globalAdministrator() ||
+        (signedIn() && resource.data.senderId == request.auth.uid);
+      allow create: if signedIn() &&
+        account().role in ["Manager", "Service Provider", "Customer"] &&
+        request.resource.data.keys().hasOnly([
+          "subject", "message", "category", "shopId", "shopName",
+          "senderId", "senderName", "senderRole", "status", "createdAt"
+        ]) &&
+        request.resource.data.senderId == request.auth.uid &&
+        request.resource.data.senderName == account().name &&
+        request.resource.data.senderRole == account().role &&
+        request.resource.data.subject is string &&
+        request.resource.data.subject.size() >= 2 && request.resource.data.subject.size() <= 120 &&
+        request.resource.data.message is string &&
+        request.resource.data.message.size() >= 10 && request.resource.data.message.size() <= 2000 &&
+        request.resource.data.category in ["Bug", "Booking", "Payment", "Account", "Other"] &&
+        request.resource.data.status == "New" && request.resource.data.createdAt == request.time &&
+        request.resource.data.shopId is string && request.resource.data.shopId.size() <= 128 &&
+        (request.resource.data.shopId == "" || request.resource.data.shopId.matches('^[^/]+$')) &&
+        request.resource.data.shopName is string && request.resource.data.shopName.size() <= 120 &&
+        (
+          (request.resource.data.shopId == "" && request.resource.data.shopName == "") ||
+          (exists(/databases/$(database)/documents/shops/$(request.resource.data.shopId)/members/$(request.auth.uid)) &&
+            request.resource.data.shopName == get(/databases/$(database)/documents/shops/$(request.resource.data.shopId)).data.name)
+        );
+      allow update: if globalAdministrator() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "reviewedBy", "updatedAt"]) &&
+        request.resource.data.status in ["New", "Reviewed"] &&
+        request.resource.data.reviewedBy == request.auth.uid && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+    match /subscriptionReferences/{id} {
+      allow get: if globalAdministrator();
+      allow list: if false;
+      allow create: if signedIn() &&
+        request.resource.data.keys().hasOnly(["shopId", "submittedBy", "createdAt"]) &&
+        request.resource.data.submittedBy == request.auth.uid && request.resource.data.createdAt == request.time &&
+        id.matches('^[A-Z0-9-]{6,40}$') &&
+        getAfter(/databases/$(database)/documents/shops/$(request.resource.data.shopId)/subscriptionPaymentRequests/$(id)).data.submittedBy == request.auth.uid &&
+        getAfter(/databases/$(database)/documents/shops/$(request.resource.data.shopId)/subscriptionPaymentRequests/$(id)).data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

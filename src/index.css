@@ -1,0 +1,17 @@
+@import "./styles/fonts.css";
+@import "tailwindcss";
+@import "./styles/theme.css";
+
+.notification-count {
+  font-size: 10px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+@layer base {
+  body { @apply bg-background text-foreground antialiased; font-family: "DM Sans", sans-serif; }
+  button, a, input, select, textarea { @apply outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2; }
+  button:not(:disabled), select { cursor: pointer; }
+  button:disabled { cursor: not-allowed; }
+  ::selection { @apply bg-primary/20; }
+}

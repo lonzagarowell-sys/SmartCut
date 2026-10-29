@@ -1,0 +1,343 @@
+Project SmartCut_Paper_ERD {
+  Note: '''
+    SmartCut: A Web-Based Sales Recording and Reservation Management
+    System for Hair and Grooming Services.
+
+    Paper-aligned logical ERD, not a literal Firestore schema or SQL migration.
+    Firebase Authentication manages credentials; passwords are not stored here.
+    Shop-owned keys and relationships include shop_id for tenant isolation.
+    Monetary fields use integer centavos (PHP); business timezone is Asia/Manila.
+    The five partner establishments are records in shops, not separate tables.
+
+    sale_services logically represents embedded service arrays.
+    sales represents one transaction, not two revenues from mirrored ledgers.
+    Commission, payroll allocation, shift, and expense structures describe the
+    paper's proposed requirements and require implementation reconciliation.
+  '''
+}
+
+Enum UserRole {
+  Administrator
+  Manager
+  "Service Provider"
+  Customer
+}
+
+Table users {
+  id varchar [pk, note: 'Firebase Authentication UID']
+  full_name varchar [not null]
+  email varchar [not null, unique]
+  role UserRole [not null]
+  created_at timestamp
+  Note: 'Management, Service Provider, and Customer are the three business user groups. Administrator and Manager remain distinct application roles.'
+}
+
+Table shops {
+  id varchar [pk]
+  owner_id varchar [not null]
+  name varchar [not null]
+  location varchar
+  opening_time time
+  closing_time time
+  timezone varchar [default: 'Asia/Manila']
+  facebook_page_url text
+  active boolean
+  accepting_reservations boolean
+  Note: 'One record per partner establishment; business hours also constrain scheduling.'
+}
+
+Table shop_members {
+  shop_id varchar [not null]
+  user_id varchar [not null]
+  role UserRole [not null]
+  joined_at timestamp
+  indexes {
+    (shop_id, user_id) [pk]
+  }
+}
+
+Table customers {
+  shop_id varchar [not null]
+  id varchar [not null]
+  user_id varchar [note: 'Optional for clients without a registered account']
+  full_name varchar [not null]
+  contact_number varchar
+  email varchar
+  notes text
+  indexes {
+    (shop_id, id) [pk]
+  }
+  Note: 'Customer profiles include walk-in clients. Visit history is derived from reservations, walk-ins, and sales.'
+}
+
+Table service_providers {
+  shop_id varchar [not null]
+  user_id varchar [not null]
+  display_name varchar [not null]
+  active boolean
+  indexes {
+    (shop_id, user_id) [pk]
+  }
+  Note: 'Includes barbers, stylists, and spa technicians. A Manager may also have a service-provider profile.'
+}
+
+Table services {
+  shop_id varchar [not null]
+  id varchar [not null]
+  name varchar [not null]
+  category varchar
+  price_cents bigint [not null]
+  duration_minutes int [not null]
+  status varchar
+  indexes {
+    (shop_id, id) [pk]
+  }
+  Note: 'Service prices and durations, not product inventory.'
+}
+
+Table reservations {
+  shop_id varchar [not null]
+  id varchar [not null]
+  customer_id varchar
+  service_id varchar [not null]
+  provider_id varchar [note: 'Nullable until an any-provider booking is assigned']
+  provider_preference varchar [note: 'Specific provider or any available provider']
+  appointment_date date [not null]
+  appointment_time time [not null]
+  duration_minutes int
+  quoted_amount_cents bigint
+  status varchar
+  created_by varchar
+  created_at timestamp
+  updated_at timestamp
+  indexes {
+    (shop_id, id) [pk]
+  }
+  Note: 'Logical name for appointments. Booking locks and conflict checks are enforced by application transactions and Firestore rules, not by this diagram alone.'
+}
+
+Table walkins {
+  shop_id varchar [not null]
+  id varchar [not null]
+  customer_id varchar
+  client_name varchar [not null]
+  provider_id varchar
+  visit_date date [not null]
+  visit_time time
+  status varchar
+  registered_by varchar [not null]
+  created_at timestamp
+  indexes {
+    (shop_id, id) [pk]
+  }
+  Note: 'No reservation or registered customer account is required. Selected services are represented by the linked sale and its service lines.'
+}
+
+Table sales {
+  shop_id varchar [not null]
+  id varchar [not null]
+  reservation_id varchar
+  walkin_id varchar
+  provider_id varchar
+  customer_name varchar
+  total_cents bigint [not null]
+  currency varchar [default: 'PHP']
+  payment_method varchar [note: 'Records payment received at the counter; does not process an online charge']
+  payment_status varchar
+  transaction_date date [not null]
+  transaction_time time
+  recorded_by varchar [not null]
+  created_at timestamp
+  indexes {
+    (shop_id, id) [pk]
+    (shop_id, reservation_id) [unique]
+    (shop_id, walkin_id) [unique]
+  }
+  Note: 'Exactly one source applies: reservation_id OR walkin_id. One logical sale covers the sales/payment mirrors. Receipts and PDF reports are generated from these records.'
+}
+
+Table sale_services {
+  shop_id varchar [not null]
+  sale_id varchar [not null]
+  service_id varchar [not null]
+  service_name varchar [not null, note: 'Name snapshot at checkout']
+  price_cents bigint [not null, note: 'Price snapshot at checkout']
+  indexes {
+    (shop_id, sale_id, service_id) [pk]
+  }
+  Note: 'Logical line items for multiple distinct services, with no fixed service-count cap. Maps to embedded service arrays in Firestore; it is not an existing standalone collection.'
+}
+
+Table notifications {
+  shop_id varchar [not null]
+  id varchar [not null]
+  user_id varchar [not null]
+  reservation_id varchar
+  channel varchar [note: 'In-app or SMS']
+  title varchar
+  message text
+  recipient_phone varchar
+  is_read boolean
+  delivery_status varchar [note: 'For SMS; separate from the in-app read flag']
+  created_at timestamp
+  indexes {
+    (shop_id, id) [pk]
+  }
+  Note: 'Logical view of on-screen alerts and server-side SMS delivery records. Delivery is subject to network/gateway availability.'
+}
+
+Table shop_subscriptions {
+  shop_id varchar [pk]
+  plan_id varchar
+  plan_name varchar
+  price_cents bigint
+  status varchar
+  period_start timestamp
+  period_end timestamp
+  manual_locked boolean
+  lock_reason text
+  updated_at timestamp
+  Note: 'Current subscription/license state. Corresponds logically to subscription and access settings documents.'
+}
+
+// Supporting entities required by the manuscript; reconcile with the actual app
+// before describing these normalized structures as deployed collections.
+
+Table provider_shifts {
+  shop_id varchar [not null]
+  id varchar [not null]
+  provider_id varchar [not null]
+  shift_date date [not null]
+  start_time time [not null]
+  end_time time [not null]
+  available boolean
+  indexes {
+    (shop_id, id) [pk]
+  }
+  Note: 'Proposed paper requirement: individual provider shift scheduling. Not the same as appointment reservation locks.'
+}
+
+Table commissions {
+  shop_id varchar [not null]
+  id varchar [not null]
+  sale_id varchar [not null]
+  provider_id varchar [not null]
+  rate_percent decimal(5,2) [note: 'Commission-rate snapshot, 0 to 100']
+  basis_cents bigint [not null]
+  commission_cents bigint [not null]
+  computed_at timestamp
+  indexes {
+    (shop_id, id) [pk]
+    (shop_id, sale_id, provider_id) [unique]
+  }
+  Note: 'Proposed persisted checkout commission described in the paper. A payroll calculator alone does not establish an automatic checkout commission engine.'
+}
+
+Table payroll {
+  shop_id varchar [not null]
+  id varchar [not null]
+  provider_id varchar [not null]
+  period_start date [not null]
+  period_end date [not null]
+  total_cents bigint [not null]
+  status varchar
+  recorded_by varchar
+  recorded_at timestamp
+  indexes {
+    (shop_id, id) [pk]
+  }
+  Note: 'Logical payroll statement. Commission-to-statement allocations below are proposed, not a claim about the current record format.'
+}
+
+Table payroll_items {
+  shop_id varchar [not null]
+  payroll_id varchar [not null]
+  commission_id varchar [not null]
+  allocated_cents bigint [not null]
+  indexes {
+    (shop_id, payroll_id, commission_id) [pk]
+    (shop_id, commission_id) [unique]
+  }
+  Note: 'Proposed allocation: each commission is included in at most one payroll statement.'
+}
+
+Table expenses {
+  shop_id varchar [not null]
+  id varchar [not null]
+  category varchar
+  description text
+  amount_cents bigint [not null]
+  expense_date date [not null]
+  recorded_by varchar
+  created_at timestamp
+  indexes {
+    (shop_id, id) [pk]
+  }
+  Note: 'Proposed data required for the overhead-cost analytics claimed in the paper. Omit this entity and revise that claim if expense tracking is not in the final scope.'
+}
+
+Ref: shops.owner_id > users.id
+Ref: shop_members.shop_id > shops.id
+Ref: shop_members.user_id > users.id
+Ref: customers.shop_id > shops.id
+Ref: customers.user_id > users.id
+Ref: shop_members.(shop_id, user_id) - service_providers.(shop_id, user_id)
+Ref: services.shop_id > shops.id
+Ref: reservations.shop_id > shops.id
+Ref: reservations.(shop_id, customer_id) > customers.(shop_id, id)
+Ref: reservations.(shop_id, service_id) > services.(shop_id, id)
+Ref: reservations.(shop_id, provider_id) > service_providers.(shop_id, user_id)
+Ref: reservations.created_by > users.id
+Ref: walkins.shop_id > shops.id
+Ref: walkins.(shop_id, customer_id) > customers.(shop_id, id)
+Ref: walkins.(shop_id, provider_id) > service_providers.(shop_id, user_id)
+Ref: walkins.registered_by > users.id
+Ref: sales.shop_id > shops.id
+Ref: reservations.(shop_id, id) - sales.(shop_id, reservation_id)
+Ref: walkins.(shop_id, id) - sales.(shop_id, walkin_id)
+Ref: sales.(shop_id, provider_id) > service_providers.(shop_id, user_id)
+Ref: sales.recorded_by > users.id
+Ref: sale_services.(shop_id, sale_id) > sales.(shop_id, id)
+Ref: sale_services.(shop_id, service_id) > services.(shop_id, id)
+Ref: notifications.shop_id > shops.id
+Ref: notifications.user_id > users.id
+Ref: notifications.(shop_id, reservation_id) > reservations.(shop_id, id)
+Ref: shops.id - shop_subscriptions.shop_id
+Ref: provider_shifts.(shop_id, provider_id) > service_providers.(shop_id, user_id)
+Ref: commissions.(shop_id, sale_id) > sales.(shop_id, id)
+Ref: commissions.(shop_id, provider_id) > service_providers.(shop_id, user_id)
+Ref: payroll.(shop_id, provider_id) > service_providers.(shop_id, user_id)
+Ref: payroll.recorded_by > users.id
+Ref: payroll_items.(shop_id, payroll_id) > payroll.(shop_id, id)
+Ref: payroll_items.(shop_id, commission_id) > commissions.(shop_id, id)
+Ref: expenses.shop_id > shops.id
+Ref: expenses.recorded_by > users.id
+
+TableGroup Accounts_and_Establishments {
+  users
+  shops
+  shop_members
+  customers
+  service_providers
+}
+
+TableGroup Reservations_and_Checkout {
+  services
+  reservations
+  walkins
+  sales
+  sale_services
+}
+
+TableGroup Communication_and_Access {
+  notifications
+  shop_subscriptions
+}
+
+TableGroup Paper_Supporting_Requirements {
+  provider_shifts
+  commissions
+  payroll
+  payroll_items
+  expenses
+}

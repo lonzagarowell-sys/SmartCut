@@ -1,0 +1,89 @@
+:root {
+  --background: #f6faf7;
+  --foreground: #18382b;
+  --card: #ffffff;
+  --card-foreground: #18382b;
+  --popover: #ffffff;
+  --popover-foreground: #18382b;
+  --primary: #21724b;
+  --primary-foreground: #ffffff;
+  --secondary: #e8f3ec;
+  --secondary-foreground: #1e6543;
+  --muted: #edf4ef;
+  --muted-foreground: #5d7365;
+  --accent: #dceee2;
+  --accent-foreground: #1e6543;
+  --destructive: #b33f51;
+  --destructive-foreground: #ffffff;
+  --border: #dce8df;
+  --input: #dce8df;
+  --ring: #21724b;
+  --radius: 0.75rem;
+  --sidebar: #123e2a;
+  --sidebar-foreground: #f4faf6;
+  --chart-1: #21724b;
+  --chart-2: #398976;
+  --chart-3: #55836b;
+  --chart-4: #3b6a50;
+  --chart-5: #738e59;
+}
+[data-shop-theme="forest"] {
+  --primary: #21724b;
+  --secondary: #e8f3ec;
+  --accent: #dceee2;
+  --ring: #21724b;
+  --sidebar: #123e2a;
+}
+[data-shop-theme="ocean"] {
+  --primary: #245d83;
+  --secondary: #e8f1f7;
+  --accent: #dbeaf4;
+  --ring: #245d83;
+  --sidebar: #15364d;
+}
+[data-shop-theme="plum"] {
+  --primary: #75416d;
+  --secondary: #f3eaf1;
+  --accent: #eadce7;
+  --ring: #75416d;
+  --sidebar: #43253e;
+}
+[data-shop-theme="bronze"] {
+  --primary: #83552d;
+  --secondary: #f5eee5;
+  --accent: #ecdfcf;
+  --ring: #83552d;
+  --sidebar: #49321f;
+}
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --font-sans: "DM Sans", sans-serif;
+  --font-display: "Manrope", sans-serif;
+  --text-xs: 1rem;
+  --text-xs--line-height: 1.5;
+  --text-sm: 1.125rem;
+  --text-sm--line-height: 1.5;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}

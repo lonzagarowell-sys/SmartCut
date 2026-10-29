@@ -1,0 +1,10 @@
+{
+  "description": "This web application streamlines communication for teams by facilitating real-time messaging and collaboration, enhancing productivity and engagement.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
